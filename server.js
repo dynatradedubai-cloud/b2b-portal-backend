@@ -17,7 +17,7 @@ app.use(express.json());
 
 /* ================= STORAGE ================= */
 
-const upload = multer({ dest: "uploads/" });
+const upload = multer({ dest: "/tmp/" });
 
 let users = [];
 let priceList = [];
