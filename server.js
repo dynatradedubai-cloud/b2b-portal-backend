@@ -4,187 +4,137 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const CryptoJS = require("crypto-js");
-const { RateLimiterMemory } = require("rate-limiter-flexible");
+const multer = require("multer");
+const XLSX = require("xlsx");
+const moment = require("moment-timezone");
+const fs = require("fs");
+
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ================= MEMORY STORE (TEMP) ================= */
+/* ================= STORAGE ================= */
+
+const upload = multer({ dest: "uploads/" });
+
 let users = [];
-let otpStore = {};
-let auditLogs = [];
-
-/* ================= RATE LIMIT ================= */
-const loginLimiter = new RateLimiterMemory({
-  points: 5,
-  duration: 60
-});
-
-/* ================= EMAIL ================= */
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_SERVER,
-  port: process.env.SMTP_PORT,
-  secure: false,
-  auth: {
-    user: process.env.SENDER_EMAIL,
-    pass: process.env.SENDER_APP_PASSWORD
-  }
-});
+let priceList = [];
+let lastUpdated = null;
 
 /* ================= HELPERS ================= */
 
-function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+function encrypt(data) {
+  return CryptoJS.AES.encrypt(
+    JSON.stringify(data),
+    process.env.ENCRYPTION_KEY
+  ).toString();
 }
 
-function logEvent(event) {
-  auditLogs.unshift({
-    time: new Date().toISOString(),
-    ...event
-  });
-  if (auditLogs.length > 1000) auditLogs.pop();
+function decrypt(data) {
+  const bytes = CryptoJS.AES.decrypt(data, process.env.ENCRYPTION_KEY);
+  return JSON.parse(bytes.toString(CryptoJS.enc.Utf8));
 }
 
-/* ================= ADMIN LOGIN ================= */
+function getUAETime() {
+  return moment().tz("Asia/Dubai").format("DD MMM YYYY, hh:mm A");
+}
 
-app.post("/admin/login", async (req, res) => {
-  const { username, password } = req.body;
+/* ================= ADMIN UPLOAD USER ================= */
 
-  if (
-    username === process.env.ADMIN_EMAIL &&
-    password === process.env.ADMIN_PASSWORD
-  ) {
-    const token = jwt.sign({ role: "admin" }, process.env.JWT_SECRET, {
-      expiresIn: "1h"
-    });
+app.post("/admin/upload-users", upload.single("file"), (req, res) => {
+  const file = XLSX.readFile(req.file.path);
+  const sheet = XLSX.utils.sheet_to_json(file.Sheets[file.SheetNames[0]]);
 
-    return res.json({ token });
-  }
+  // VALIDATE
+  const required = [
+    "Username",
+    "Password",
+    "Customer Name",
+    "Customer Code",
+    "Customer email ID",
+    "Sales Man name",
+    "Salesman contact no.",
+    "Salesman Email ID"
+  ];
 
-  return res.status(401).json({ message: "Invalid admin login" });
-});
-
-/* ================= USER LOGIN ================= */
-
-app.post("/login", async (req, res) => {
-  const { username, password } = req.body;
-
-  try {
-    await loginLimiter.consume(username);
-  } catch {
-    return res.status(429).json({ message: "Too many attempts" });
-  }
-
-  const user = users.find((u) => u.username === username);
-
-  if (!user) {
-    logEvent({ event: "Invalid Username", username });
-    return res.status(400).json({ message: "User not found" });
-  }
-
-  const match = await bcrypt.compare(password, user.password);
-
-  if (!match) {
-    logEvent({ event: "Wrong Password", username });
-    return res.status(400).json({ message: "Wrong password" });
-  }
-
-  const otp = generateOTP();
-  const hash = await bcrypt.hash(otp, 10);
-
-  otpStore[username] = {
-    hash,
-    expires: Date.now() + 5 * 60 * 1000,
-    attempts: 0
-  };
-
-  await transporter.sendMail({
-    from: process.env.SENDER_EMAIL,
-    to: user.email,
-    subject: "Your OTP",
-    text: `Your OTP is ${otp}`
-  });
-
-  logEvent({ event: "OTP Sent", username });
-
-  res.json({ message: "OTP sent" });
-});
-
-/* ================= VERIFY OTP ================= */
-
-app.post("/verify-otp", async (req, res) => {
-  const { username, otp } = req.body;
-
-  const record = otpStore[username];
-
-  if (!record) return res.status(400).json({ message: "No OTP found" });
-
-  if (Date.now() > record.expires)
-    return res.status(400).json({ message: "OTP expired" });
-
-  const match = await bcrypt.compare(otp, record.hash);
-
-  if (!match) {
-    record.attempts++;
-
-    if (record.attempts >= 3) {
-      logEvent({ event: "Account Blocked", username });
-      return res.status(403).json({ message: "Blocked after 3 attempts" });
+  for (let col of required) {
+    if (!sheet[0][col]) {
+      return res.status(400).json({ message: `Missing column: ${col}` });
     }
-
-    return res.status(400).json({ message: "Wrong OTP" });
   }
 
-  const token = jwt.sign({ username }, process.env.JWT_SECRET, {
-    expiresIn: "1h"
-  });
+  users = sheet.map((u) => ({
+    username: u["Username"],
+    password: bcrypt.hashSync(u["Password"], 10),
+    name: u["Customer Name"],
+    code: u["Customer Code"],
+    email: u["Customer email ID"],
+    salesman: u["Sales Man name"],
+    phone: u["Salesman contact no."],
+    salesEmail: u["Salesman Email ID"]
+  }));
 
-  delete otpStore[username];
+  const encrypted = encrypt(users);
+  fs.writeFileSync("users.enc", encrypted);
 
-  logEvent({ event: "Login Success", username });
+  lastUpdated = getUAETime();
 
-  res.json({ token });
+  res.json({ message: "Users uploaded", lastUpdated });
 });
 
-/* ================= PROTECTED ================= */
+/* ================= ADMIN UPLOAD PRICE ================= */
 
-function auth(req, res, next) {
-  const token = req.headers.authorization;
+app.post("/admin/upload-price", upload.single("file"), (req, res) => {
+  const file = XLSX.readFile(req.file.path);
+  const sheet = XLSX.utils.sheet_to_json(file.Sheets[file.SheetNames[0]]);
 
-  if (!token) return res.status(401).json({ message: "No token" });
+  const required = [
+    "Brand",
+    "Vehicle",
+    "OE Part Number",
+    "Manufacturing Part Number",
+    "Part Description",
+    "Stock",
+    "Unit Price in AED"
+  ];
 
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch {
-    res.status(401).json({ message: "Invalid token" });
+  for (let col of required) {
+    if (!sheet[0][col]) {
+      return res.status(400).json({ message: `Missing column: ${col}` });
+    }
   }
-}
 
-/* ================= SAMPLE DATA ================= */
+  priceList = sheet;
 
-app.post("/admin/create-user", async (req, res) => {
-  const { username, password, email, name } = req.body;
+  const encrypted = encrypt(priceList);
+  fs.writeFileSync("price.enc", encrypted);
 
-  const hash = await bcrypt.hash(password, 10);
+  lastUpdated = getUAETime();
 
-  users.push({
-    username,
-    password: hash,
-    email,
-    name
-  });
-
-  res.json({ message: "User created" });
+  res.json({ message: "Price list uploaded", lastUpdated });
 });
 
-/* ================= AUDIT ================= */
+/* ================= SEARCH ================= */
 
-app.get("/admin/logs", (req, res) => {
-  res.json(auditLogs.slice(0, 10));
+app.post("/search", (req, res) => {
+  const { query } = req.body;
+
+  const result = priceList.filter((p) =>
+    Object.values(p)
+      .join(" ")
+      .toLowerCase()
+      .includes(query.toLowerCase())
+  ).slice(0, 20);
+
+  res.json(result);
+});
+
+/* ================= LAST UPDATED ================= */
+
+app.get("/last-updated", (req, res) => {
+  res.json({ lastUpdated });
 });
 
 /* ================= START ================= */
