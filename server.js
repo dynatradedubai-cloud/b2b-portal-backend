@@ -6,8 +6,10 @@ const nodemailer = require("nodemailer");
 const CryptoJS = require("crypto-js");
 const multer = require("multer");
 const XLSX = require("xlsx");
-const moment = require("moment-timezone");
 const fs = require("fs");
+const moment = require("moment-timezone");
+const rateLimit = require("express-rate-limit");
+
 require("dotenv").config();
 
 const app = express();
@@ -16,25 +18,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ================= STORAGE ================= */
 const upload = multer({ dest: "/tmp/" });
+
+/* ================= SECURITY ================= */
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200
+});
+app.use(limiter);
+
+/* ================= STORAGE ================= */
 
 let users = [];
 let priceList = [];
+let logs = [];
 let otps = {};
+let searchCount = {};
+let campaigns = [];
 let lastUpdated = null;
 
 /* ================= HELPERS ================= */
 
-const normalize = (str) =>
-  String(str || "").toLowerCase().replace(/\s+/g, "");
-
-const getValue = (obj, key) => {
-  const found = Object.keys(obj).find(
-    (k) => normalize(k) === normalize(key)
-  );
-  return found ? obj[found] : null;
-};
+const normalize = (s) =>
+  String(s || "").toLowerCase().replace(/\s+/g, "");
 
 function encrypt(data) {
   return CryptoJS.AES.encrypt(
@@ -51,29 +59,27 @@ function decrypt(data) {
   return JSON.parse(bytes.toString(CryptoJS.enc.Utf8));
 }
 
+function logEvent(event) {
+  logs.unshift({
+    ...event,
+    time: new Date().toISOString()
+  });
+}
+
 function getUAETime() {
   return moment().tz("Asia/Dubai").format("DD MMM YYYY, hh:mm A");
 }
 
-/* ================= LOAD DATA ON START ================= */
+/* ================= LOAD DATA ================= */
 
-const loadData = () => {
-  try {
-    if (fs.existsSync("price.enc")) {
-      const enc = fs.readFileSync("price.enc", "utf8");
-      priceList = decrypt(enc);
-      console.log("Price list loaded:", priceList.length);
-    }
-
-    if (fs.existsSync("users.enc")) {
-      const enc = fs.readFileSync("users.enc", "utf8");
-      users = decrypt(enc);
-      console.log("Users loaded:", users.length);
-    }
-  } catch (err) {
-    console.log("Load error:", err.message);
+function loadData() {
+  if (fs.existsSync("users.enc")) {
+    users = decrypt(fs.readFileSync("users.enc", "utf8"));
   }
-};
+  if (fs.existsSync("price.enc")) {
+    priceList = decrypt(fs.readFileSync("price.enc", "utf8"));
+  }
+}
 
 loadData();
 
@@ -87,7 +93,21 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-/* ================= ADMIN LOGIN ================= */
+/* ================= AUTH ================= */
+
+function verifyAdmin(req, res, next) {
+  const token = req.headers.authorization;
+  if (!token) return res.status(403).json({ message: "Unauthorized" });
+
+  try {
+    jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(403).json({ message: "Invalid token" });
+  }
+}
+
+/* ================= ADMIN ================= */
 
 app.post("/admin/login", (req, res) => {
   const { username, password } = req.body;
@@ -103,15 +123,53 @@ app.post("/admin/login", (req, res) => {
   res.status(401).json({ message: "Invalid admin login" });
 });
 
-/* ================= USER LOGIN ================= */
+/* ================= UPLOAD USERS ================= */
+
+app.post("/admin/upload-users", verifyAdmin, upload.single("file"), (req, res) => {
+  const wb = XLSX.readFile(req.file.path);
+  const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+
+  users = data.map((u) => ({
+    username: u["Username"],
+    password: bcrypt.hashSync(String(u["Password"]), 10),
+    name: u["Customer Name"],
+    email: u["Customer email ID"],
+    salesman: u["Sales Man name"],
+    phone: u["Salesman contact no."],
+    limit: u["Max search per day"] || 50
+  }));
+
+  fs.writeFileSync("users.enc", encrypt(users));
+  lastUpdated = getUAETime();
+
+  res.json({ message: "Users uploaded", lastUpdated });
+});
+
+/* ================= UPLOAD PRICE ================= */
+
+app.post("/admin/upload-price", verifyAdmin, upload.single("file"), (req, res) => {
+  const wb = XLSX.readFile(req.file.path);
+  priceList = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+
+  fs.writeFileSync("price.enc", encrypt(priceList));
+  lastUpdated = getUAETime();
+
+  res.json({ message: "Price uploaded", count: priceList.length });
+});
+
+/* ================= LOGIN ================= */
 
 app.post("/login", (req, res) => {
   const { username, password } = req.body;
 
   const user = users.find((u) => u.username === username);
-  if (!user) return res.status(400).json({ message: "User not found" });
+  if (!user) {
+    logEvent({ type: "invalid_user", username });
+    return res.status(400).json({ message: "User not found" });
+  }
 
   if (!bcrypt.compareSync(password, user.password)) {
+    logEvent({ type: "wrong_password", username });
     return res.status(400).json({ message: "Wrong password" });
   }
 
@@ -119,7 +177,8 @@ app.post("/login", (req, res) => {
 
   otps[username] = {
     otp,
-    expires: Date.now() + 5 * 60 * 1000
+    expires: Date.now() + 5 * 60 * 1000,
+    attempts: 0
   };
 
   transporter.sendMail({
@@ -132,7 +191,7 @@ app.post("/login", (req, res) => {
   res.json({ message: "OTP sent" });
 });
 
-/* ================= VERIFY OTP ================= */
+/* ================= OTP ================= */
 
 app.post("/verify-otp", (req, res) => {
   const { username, otp } = req.body;
@@ -141,7 +200,14 @@ app.post("/verify-otp", (req, res) => {
   if (!record) return res.status(400).json({ message: "No OTP" });
 
   if (record.expires < Date.now())
-    return res.status(400).json({ message: "OTP expired" });
+    return res.status(400).json({ message: "Expired OTP" });
+
+  record.attempts++;
+
+  if (record.attempts > 3) {
+    logEvent({ type: "otp_block", username });
+    return res.status(403).json({ message: "Too many attempts" });
+  }
 
   if (record.otp !== otp)
     return res.status(400).json({ message: "Invalid OTP" });
@@ -153,95 +219,71 @@ app.post("/verify-otp", (req, res) => {
   res.json({ token });
 });
 
-/* ================= UPLOAD USERS ================= */
-
-app.post("/admin/upload-users", upload.single("file"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: "No file" });
-
-    const wb = XLSX.readFile(req.file.path);
-    const sheet = XLSX.utils.sheet_to_json(
-      wb.Sheets[wb.SheetNames[0]]
-    );
-
-    users = sheet.map((u) => ({
-      username: getValue(u, "Username"),
-      password: bcrypt.hashSync(String(getValue(u, "Password")), 10),
-      name: getValue(u, "Customer Name"),
-      code: getValue(u, "Customer Code"),
-      email: getValue(u, "Customer email ID"),
-      salesman: getValue(u, "Sales Man name"),
-      phone: getValue(u, "Salesman contact no."),
-      salesEmail: getValue(u, "Salesman Email ID")
-    }));
-
-    fs.writeFileSync("users.enc", encrypt(users));
-
-    lastUpdated = getUAETime();
-
-    res.json({ message: "Users uploaded", lastUpdated });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: err.message });
-  }
-});
-
-/* ================= UPLOAD PRICE ================= */
-
-app.post("/admin/upload-price", upload.single("file"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: "No file" });
-
-    const wb = XLSX.readFile(req.file.path);
-    const sheet = XLSX.utils.sheet_to_json(
-      wb.Sheets[wb.SheetNames[0]]
-    );
-
-    priceList = sheet;
-
-    fs.writeFileSync("price.enc", encrypt(priceList));
-
-    lastUpdated = getUAETime();
-
-    res.json({
-      message: "Price uploaded",
-      count: priceList.length,
-      lastUpdated
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: err.message });
-  }
-});
-
-/* ================= SEARCH (FAST 50K SUPPORT) ================= */
+/* ================= SEARCH ================= */
 
 app.post("/search", (req, res) => {
-  try {
-    const q = normalize(req.body.query);
+  const { query, username } = req.body;
 
-    const result = priceList
-      .filter((p) =>
-        Object.values(p)
-          .join(" ")
-          .toLowerCase()
-          .includes(q)
-      )
-      .slice(0, 20);
+  const user = users.find((u) => u.username === username);
 
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
+  if (!searchCount[username]) searchCount[username] = 0;
+
+  if (searchCount[username] >= user.limit) {
+    return res.status(403).json({ message: "Daily limit reached" });
   }
+
+  searchCount[username]++;
+
+  const q = normalize(query);
+
+  const result = priceList
+    .filter((p) =>
+      Object.values(p)
+        .join(" ")
+        .toLowerCase()
+        .includes(q)
+    )
+    .slice(0, 20);
+
+  logEvent({
+    type: "search",
+    username,
+    query,
+    found: result.length
+  });
+
+  if (result.length === 0) {
+    logEvent({ type: "not_found", username, query });
+  }
+
+  res.json(result);
 });
 
-/* ================= LAST UPDATED ================= */
+/* ================= CAMPAIGNS ================= */
 
-app.get("/last-updated", (req, res) => {
-  res.json({ lastUpdated });
+app.post("/admin/upload-campaign", verifyAdmin, upload.single("file"), (req, res) => {
+  campaigns.push({
+    name: req.file.originalname,
+    expiry: req.body.expiry
+  });
+
+  res.json({ message: "Campaign added" });
 });
 
-/* ================= START SERVER ================= */
+app.get("/campaigns", (req, res) => {
+  const active = campaigns.filter(
+    (c) => new Date(c.expiry) > new Date()
+  );
+  res.json(active);
+});
+
+/* ================= LOGS ================= */
+
+app.get("/admin/logs", verifyAdmin, (req, res) => {
+  res.json(logs.slice(0, 10));
+});
+
+/* ================= START ================= */
 
 app.listen(process.env.PORT, () => {
   console.log("Server running on port", process.env.PORT);
