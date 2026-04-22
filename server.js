@@ -11,32 +11,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const upload = multer({ dest: "uploads/" });
+// ✅ IMPORTANT (Render safe)
+const upload = multer({ dest: "/tmp" });
 
-/* ================= STORAGE ================= */
+/* ================= DATA ================= */
 let users = [];
 let priceList = [];
 
-/* ================= HELPERS ================= */
-function saveUsers() {
-  fs.writeFileSync("users.json", JSON.stringify(users));
+/* ================= LOAD DATA ================= */
+if (fs.existsSync("users.json")) {
+  users = JSON.parse(fs.readFileSync("users.json"));
+}
+if (fs.existsSync("price.json")) {
+  priceList = JSON.parse(fs.readFileSync("price.json"));
 }
 
-function savePrice() {
-  fs.writeFileSync("price.json", JSON.stringify(priceList));
-}
-
-function loadData() {
-  if (fs.existsSync("users.json")) {
-    users = JSON.parse(fs.readFileSync("users.json"));
-  }
-  if (fs.existsSync("price.json")) {
-    priceList = JSON.parse(fs.readFileSync("price.json"));
-  }
-}
-loadData();
-
-/* ================= ADMIN TOKEN CHECK ================= */
+/* ================= AUTH ================= */
 function verifyAdmin(req, res, next) {
   let auth = req.headers.authorization;
 
@@ -69,35 +59,75 @@ app.post("/admin/login", (req, res) => {
     return res.json({ token });
   }
 
-  res.status(401).json({ message: "Invalid admin login" });
+  res.status(401).json({ message: "Invalid login" });
 });
 
 /* ================= UPLOAD USERS ================= */
 app.post("/admin/upload-users", verifyAdmin, upload.single("file"), (req, res) => {
-  const wb = XLSX.readFile(req.file.path);
-  const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
 
-  users = data.map((u) => ({
-    username: u["Username"],
-    password: bcrypt.hashSync(String(u["Password"]), 10),
-    name: u["Customer Name"],
-    email: u["Customer email ID"],
-    limit: u["Max search per day"] || 50
-  }));
+    const wb = XLSX.readFile(req.file.path);
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json(sheet);
 
-  saveUsers();
+    if (!data.length) {
+      return res.status(400).json({ message: "Excel empty" });
+    }
 
-  res.json({ message: "Users uploaded", count: users.length });
+    users = data.map((u) => ({
+      username: String(u["Username"]).trim(),
+      password: bcrypt.hashSync(String(u["Password"]), 10),
+      name: u["Customer Name"] || "",
+      email: u["Customer email ID"] || "",
+      limit: Number(u["Max search per day"] || 50)
+    }));
+
+    fs.writeFileSync("users.json", JSON.stringify(users, null, 2));
+
+    res.json({
+      message: "Users uploaded",
+      count: users.length
+    });
+
+  } catch (err) {
+    console.log("UPLOAD USERS ERROR:", err);
+    res.status(500).json({
+      message: "Upload failed",
+      error: err.message
+    });
+  }
 });
 
 /* ================= UPLOAD PRICE ================= */
 app.post("/admin/upload-price", verifyAdmin, upload.single("file"), (req, res) => {
-  const wb = XLSX.readFile(req.file.path);
-  priceList = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
 
-  savePrice();
+    const wb = XLSX.readFile(req.file.path);
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json(sheet);
 
-  res.json({ message: "Price uploaded", count: priceList.length });
+    priceList = data;
+
+    fs.writeFileSync("price.json", JSON.stringify(priceList, null, 2));
+
+    res.json({
+      message: "Price uploaded",
+      count: priceList.length
+    });
+
+  } catch (err) {
+    console.log("UPLOAD PRICE ERROR:", err);
+    res.status(500).json({
+      message: "Upload failed",
+      error: err.message
+    });
+  }
 });
 
 /* ================= CUSTOMER LOGIN ================= */
@@ -105,7 +135,10 @@ app.post("/login", (req, res) => {
   const { username, password } = req.body;
 
   const user = users.find((u) => u.username === username);
-  if (!user) return res.json({ message: "User not found" });
+
+  if (!user) {
+    return res.json({ message: "User not found" });
+  }
 
   if (!bcrypt.compareSync(password, user.password)) {
     return res.json({ message: "Wrong password" });
@@ -123,7 +156,7 @@ app.post("/search", (req, res) => {
       Object.values(p)
         .join(" ")
         .toLowerCase()
-        .includes(query.toLowerCase())
+        .includes(String(query).toLowerCase())
     )
     .slice(0, 20);
 
