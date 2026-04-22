@@ -8,7 +8,6 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const moment = require("moment-timezone");
 const fs = require("fs");
-
 require("dotenv").config();
 
 const app = express();
@@ -27,6 +26,16 @@ let lastUpdated = null;
 
 /* ================= HELPERS ================= */
 
+const normalize = (str) =>
+  String(str || "").toLowerCase().replace(/\s+/g, "");
+
+const getValue = (obj, key) => {
+  const found = Object.keys(obj).find(
+    (k) => normalize(k) === normalize(key)
+  );
+  return found ? obj[found] : null;
+};
+
 function encrypt(data) {
   return CryptoJS.AES.encrypt(
     JSON.stringify(data),
@@ -34,11 +43,41 @@ function encrypt(data) {
   ).toString();
 }
 
+function decrypt(data) {
+  const bytes = CryptoJS.AES.decrypt(
+    data,
+    process.env.ENCRYPTION_KEY
+  );
+  return JSON.parse(bytes.toString(CryptoJS.enc.Utf8));
+}
+
 function getUAETime() {
   return moment().tz("Asia/Dubai").format("DD MMM YYYY, hh:mm A");
 }
 
-/* ================= EMAIL (OTP) ================= */
+/* ================= LOAD DATA ON START ================= */
+
+const loadData = () => {
+  try {
+    if (fs.existsSync("price.enc")) {
+      const enc = fs.readFileSync("price.enc", "utf8");
+      priceList = decrypt(enc);
+      console.log("Price list loaded:", priceList.length);
+    }
+
+    if (fs.existsSync("users.enc")) {
+      const enc = fs.readFileSync("users.enc", "utf8");
+      users = decrypt(enc);
+      console.log("Users loaded:", users.length);
+    }
+  } catch (err) {
+    console.log("Load error:", err.message);
+  }
+};
+
+loadData();
+
+/* ================= EMAIL ================= */
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -67,36 +106,30 @@ app.post("/admin/login", (req, res) => {
 /* ================= USER LOGIN ================= */
 
 app.post("/login", (req, res) => {
-  try {
-    const { username, password } = req.body;
+  const { username, password } = req.body;
 
-    const user = users.find((u) => u.username === username);
-    if (!user) return res.status(400).json({ message: "User not found" });
+  const user = users.find((u) => u.username === username);
+  if (!user) return res.status(400).json({ message: "User not found" });
 
-    if (!bcrypt.compareSync(password, user.password)) {
-      return res.status(400).json({ message: "Wrong password" });
-    }
-
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-    otps[username] = {
-      otp,
-      expires: Date.now() + 5 * 60 * 1000
-    };
-
-    transporter.sendMail({
-      from: process.env.SENDER_EMAIL,
-      to: user.email,
-      subject: "Your OTP",
-      text: `Your OTP is ${otp}`
-    });
-
-    res.json({ message: "OTP sent" });
-
-  } catch (error) {
-    console.error("LOGIN ERROR:", error);
-    res.status(500).json({ message: error.message });
+  if (!bcrypt.compareSync(password, user.password)) {
+    return res.status(400).json({ message: "Wrong password" });
   }
+
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+  otps[username] = {
+    otp,
+    expires: Date.now() + 5 * 60 * 1000
+  };
+
+  transporter.sendMail({
+    from: process.env.SENDER_EMAIL,
+    to: user.email,
+    subject: "OTP Login",
+    text: `Your OTP is ${otp}`
+  });
+
+  res.json({ message: "OTP sent" });
 });
 
 /* ================= VERIFY OTP ================= */
@@ -107,13 +140,11 @@ app.post("/verify-otp", (req, res) => {
   const record = otps[username];
   if (!record) return res.status(400).json({ message: "No OTP" });
 
-  if (record.expires < Date.now()) {
+  if (record.expires < Date.now())
     return res.status(400).json({ message: "OTP expired" });
-  }
 
-  if (record.otp !== otp) {
+  if (record.otp !== otp)
     return res.status(400).json({ message: "Invalid OTP" });
-  }
 
   delete otps[username];
 
@@ -126,39 +157,22 @@ app.post("/verify-otp", (req, res) => {
 
 app.post("/admin/upload-users", upload.single("file"), (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    if (!req.file) return res.status(400).json({ message: "No file" });
 
-    const workbook = XLSX.readFile(req.file.path);
+    const wb = XLSX.readFile(req.file.path);
     const sheet = XLSX.utils.sheet_to_json(
-      workbook.Sheets[workbook.SheetNames[0]]
+      wb.Sheets[wb.SheetNames[0]]
     );
 
-    const required = [
-      "Username",
-      "Password",
-      "Customer Name",
-      "Customer Code",
-      "Customer email ID",
-      "Sales Man name",
-      "Salesman contact no.",
-      "Salesman Email ID"
-    ];
-
-    for (let col of required) {
-      if (!(col in sheet[0])) {
-        return res.status(400).json({ message: `Missing column: ${col}` });
-      }
-    }
-
     users = sheet.map((u) => ({
-      username: u["Username"],
-      password: bcrypt.hashSync(String(u["Password"]), 10),
-      name: u["Customer Name"],
-      code: u["Customer Code"],
-      email: u["Customer email ID"],
-      salesman: u["Sales Man name"],
-      phone: u["Salesman contact no."],
-      salesEmail: u["Salesman Email ID"]
+      username: getValue(u, "Username"),
+      password: bcrypt.hashSync(String(getValue(u, "Password")), 10),
+      name: getValue(u, "Customer Name"),
+      code: getValue(u, "Customer Code"),
+      email: getValue(u, "Customer email ID"),
+      salesman: getValue(u, "Sales Man name"),
+      phone: getValue(u, "Salesman contact no."),
+      salesEmail: getValue(u, "Salesman Email ID")
     }));
 
     fs.writeFileSync("users.enc", encrypt(users));
@@ -166,9 +180,8 @@ app.post("/admin/upload-users", upload.single("file"), (req, res) => {
     lastUpdated = getUAETime();
 
     res.json({ message: "Users uploaded", lastUpdated });
-
   } catch (err) {
-    console.error("UPLOAD USERS ERROR:", err);
+    console.error(err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -177,28 +190,12 @@ app.post("/admin/upload-users", upload.single("file"), (req, res) => {
 
 app.post("/admin/upload-price", upload.single("file"), (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    if (!req.file) return res.status(400).json({ message: "No file" });
 
-    const workbook = XLSX.readFile(req.file.path);
+    const wb = XLSX.readFile(req.file.path);
     const sheet = XLSX.utils.sheet_to_json(
-      workbook.Sheets[workbook.SheetNames[0]]
+      wb.Sheets[wb.SheetNames[0]]
     );
-
-    const required = [
-      "Brand",
-      "Vehicle",
-      "OE Part Number",
-      "Manufacturing Part Number",
-      "Part Description",
-      "Stock",
-      "Unit Price in AED"
-    ];
-
-    for (let col of required) {
-      if (!(col in sheet[0])) {
-        return res.status(400).json({ message: `Missing column: ${col}` });
-      }
-    }
 
     priceList = sheet;
 
@@ -206,33 +203,34 @@ app.post("/admin/upload-price", upload.single("file"), (req, res) => {
 
     lastUpdated = getUAETime();
 
-    res.json({ message: "Price uploaded", lastUpdated });
-
+    res.json({
+      message: "Price uploaded",
+      count: priceList.length,
+      lastUpdated
+    });
   } catch (err) {
-    console.error("UPLOAD PRICE ERROR:", err);
+    console.error(err);
     res.status(500).json({ message: err.message });
   }
 });
 
-/* ================= SEARCH ================= */
+/* ================= SEARCH (FAST 50K SUPPORT) ================= */
 
 app.post("/search", (req, res) => {
   try {
-    const { query } = req.body;
+    const q = normalize(req.body.query);
 
     const result = priceList
       .filter((p) =>
         Object.values(p)
           .join(" ")
           .toLowerCase()
-          .includes(query.toLowerCase())
+          .includes(q)
       )
       .slice(0, 20);
 
     res.json(result);
-
   } catch (err) {
-    console.error("SEARCH ERROR:", err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -243,7 +241,7 @@ app.get("/last-updated", (req, res) => {
   res.json({ lastUpdated });
 });
 
-/* ================= START ================= */
+/* ================= START SERVER ================= */
 
 app.listen(process.env.PORT, () => {
   console.log("Server running on port", process.env.PORT);
