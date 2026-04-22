@@ -10,42 +10,32 @@ app.use(express.json());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// IN-MEMORY DATABASE
 let USERS = [];
-let PRICE_LIST = [];
-let SEARCH_LOG = [];
+let PRICE = [];
 
-// ================= LOGIN =================
+// LOGIN
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
 
-  const user = USERS.find((u) => u.username === username);
+  const user = USERS.find(u => u.username === username);
   if (!user) return res.json({ message: "User not found" });
 
-  const valid = await bcrypt.compare(password, user.password);
-  if (!valid) return res.json({ message: "Invalid password" });
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return res.json({ message: "Invalid password" });
 
   res.json({
     message: "Login success",
-    customer: user.customerName,
-    salesman: {
-      name: user.salesmanName,
-      phone: user.salesmanPhone,
-      email: user.salesmanEmail,
-    },
+    name: user.customerName,
+    salesman: user.salesmanPhone
   });
 });
 
-// ================= SEARCH =================
+// SEARCH
 app.post("/search", (req, res) => {
-  const { query } = req.body;
+  const q = req.body.query?.toLowerCase() || "";
 
-  if (!query) return res.json([]);
-
-  const q = query.toLowerCase();
-
-  const result = PRICE_LIST.filter((item) =>
-    Object.values(item).some((v) =>
+  const result = PRICE.filter(p =>
+    Object.values(p).some(v =>
       String(v).toLowerCase().includes(q)
     )
   ).slice(0, 20);
@@ -53,72 +43,38 @@ app.post("/search", (req, res) => {
   res.json(result);
 });
 
-// ================= ADMIN LOGIN =================
+// ADMIN LOGIN
 app.post("/admin/login", (req, res) => {
-  const { email, password } = req.body;
-
   if (
-    email === process.env.ADMIN_EMAIL &&
-    password === process.env.ADMIN_PASSWORD
-  ) {
-    return res.json({ token: "admin-token" });
-  }
+    req.body.email === process.env.ADMIN_EMAIL &&
+    req.body.password === process.env.ADMIN_PASSWORD
+  ) return res.json({ token: "ok" });
 
-  res.status(401).json({ message: "Invalid admin" });
+  res.status(401).json({ message: "Invalid" });
 });
 
-// ================= UPLOAD USERS =================
-app.post(
-  "/admin/upload-users",
-  upload.single("file"),
-  async (req, res) => {
-    try {
-      const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      const data = XLSX.utils.sheet_to_json(sheet);
+// UPLOAD USERS
+app.post("/admin/upload-users", upload.single("file"), async (req, res) => {
+  const wb = XLSX.read(req.file.buffer);
+  const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
 
-      USERS = await Promise.all(
-        data.map(async (row) => ({
-          username: row.Username,
-          password: await bcrypt.hash(String(row.Password), 10),
-          customerName: row["Customer Name"],
-          customerCode: row["Customer Code"],
-          maxSearch: row["Max search per day"],
-          email: row["Customer email ID"],
-          salesmanName: row["Sales Man name"],
-          salesmanPhone: row["Salesman contact no."],
-          salesmanEmail: row["Salesman Email ID"],
-        }))
-      );
+  USERS = await Promise.all(
+    data.map(async r => ({
+      username: r.Username,
+      password: await bcrypt.hash(String(r.Password), 10),
+      customerName: r["Customer Name"],
+      salesmanPhone: r["Salesman contact no."]
+    }))
+  );
 
-      res.json({ message: "Users uploaded", count: USERS.length });
-    } catch (err) {
-      res.status(500).json({ message: "Upload error" });
-    }
-  }
-);
+  res.json({ message: "Users uploaded", count: USERS.length });
+});
 
-// ================= UPLOAD PRICE LIST =================
-app.post(
-  "/admin/upload-price",
-  upload.single("file"),
-  (req, res) => {
-    try {
-      const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      PRICE_LIST = XLSX.utils.sheet_to_json(sheet);
+// UPLOAD PRICE
+app.post("/admin/upload-price", upload.single("file"), (req, res) => {
+  const wb = XLSX.read(req.file.buffer);
+  PRICE = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+  res.json({ message: "Price uploaded", count: PRICE.length });
+});
 
-      res.json({
-        message: "Price list uploaded",
-        count: PRICE_LIST.length,
-      });
-    } catch (err) {
-      res.status(500).json({ message: "Upload error" });
-    }
-  }
-);
-
-// ================= START =================
-app.listen(5000, () =>
-  console.log("Server running on port 5000")
-);
+app.listen(5000, () => console.log("Running"));
